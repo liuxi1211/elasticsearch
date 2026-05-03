@@ -314,8 +314,8 @@ final class Bootstrap {
     }
 
     private void start() throws NodeValidationException {
-        node.start();
-        keepAliveThread.start();
+        node.start(); // 启动 Node
+        keepAliveThread.start(); // 启动保持存活的线程（非守护线程）
     }
 
     static void stop() throws IOException {
@@ -390,7 +390,7 @@ final class Bootstrap {
             // setDefaultUncaughtExceptionHandler
             Thread.setDefaultUncaughtExceptionHandler(new ElasticsearchUncaughtExceptionHandler());
 
-            INSTANCE.setup(true, environment);
+            INSTANCE.setup(true, environment); //核心初始化
 
             try {
                 // any secure settings must be read during node construction
@@ -399,7 +399,7 @@ final class Bootstrap {
                 throw new BootstrapException(e);
             }
 
-            INSTANCE.start();
+            INSTANCE.start(); //启动节点
 
             // We don't close stderr if `--quiet` is passed, because that
             // hides fatal startup errors. For example, if Elasticsearch is
