@@ -69,7 +69,15 @@ public class RepositoriesSetupPlugin implements Plugin<Project> {
             // such that we don't have to pass hardcoded files to gradle
             repos.mavenLocal();
         }
-        repos.jcenter();
+        // 使用阿里云镜像源
+        repos.maven(repo -> {
+            repo.setName("aliyun-public");
+            repo.setUrl("https://maven.aliyun.com/repository/public");
+        });
+        repos.maven(repo -> {
+            repo.setName("aliyun-gradle-plugin");
+            repo.setUrl("https://maven.aliyun.com/repository/gradle-plugin");
+        });
 
         String luceneVersion = VersionProperties.getLucene();
         if (luceneVersion.contains("-snapshot")) {
