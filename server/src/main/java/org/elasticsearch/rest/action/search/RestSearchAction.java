@@ -62,12 +62,25 @@ import static org.elasticsearch.rest.RestRequest.Method.GET;
 import static org.elasticsearch.rest.RestRequest.Method.POST;
 import static org.elasticsearch.search.suggest.SuggestBuilders.termSuggestion;
 
+/**
+ * REST 搜索操作处理器
+ * 
+ * 这是 Elasticsearch 搜索 API 的 REST 层入口，负责：
+ * 1. 定义搜索 API 的 REST 路由（如 GET/POST /_search）
+ * 2. 解析 HTTP 请求参数和请求体
+ * 3. 构建 SearchRequest 对象
+ * 4. 调用内部的 SearchAction 执行实际搜索逻辑
+ * 
+ * 完整调用流程：
+ * HTTP Request → RestController → RestSearchAction → SearchAction → TransportSearchAction → 各分片执行 → 合并结果 → 返回响应
+ */
 public class RestSearchAction extends BaseRestHandler {
     /**
-     * Indicates whether hits.total should be rendered as an integer or an object
-     * in the rest search response.
+     * 指示 hits.total 在 REST 搜索响应中应该呈现为整数还是对象
+     * 当设置为 true 时，total_hits 以整数形式返回；否则以对象形式返回（包含 value 和 relation）
      */
     public static final String TOTAL_HITS_AS_INT_PARAM = "rest_total_hits_as_int";
+    /** 是否使用带类型的键名返回聚合、建议器等结果 */
     public static final String TYPED_KEYS_PARAM = "typed_keys";
     private static final Set<String> RESPONSE_PARAMS;
 
@@ -77,14 +90,28 @@ public class RestSearchAction extends BaseRestHandler {
     }
 
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(RestSearchAction.class);
+    /** 类型（type）相关的弃用警告消息 */
     public static final String TYPES_DEPRECATION_MESSAGE = "[types removal]" +
         " Specifying types in search requests is deprecated.";
 
+    /**
+     * 获取此处理器的名称标识
+     * @return 处理器名称 "search_action"
+     */
     @Override
     public String getName() {
         return "search_action";
     }
 
+    /**
+     * 定义此处理器支持的 REST 路由
+     * 支持以下路径：
+     * - GET/POST /_search （在所有索引上搜索）
+     * - GET/POST /{index}/_search （在指定索引上搜索）
+     * - GET/POST /{index}/{type}/_search （已弃用，在指定索引和类型上搜索）
+     * 
+     * @return 路由列表
+     */
     @Override
     public List<Route> routes() {
         return unmodifiableList(asList(
@@ -97,8 +124,25 @@ public class RestSearchAction extends BaseRestHandler {
             new Route(POST, "/{index}/{type}/_search")));
     }
 
+    /**
+     * 准备搜索请求的核心方法
+     * 
+     * 此方法执行以下关键步骤：
+     * 1. 创建 SearchRequest 对象
+     * 2. 解析 URL 参数和请求体，填充 SearchRequest
+     * 3. 返回一个 RestChannelConsumer，在实际发送响应时执行搜索
+     * 
+     * 注意：这里使用了 IntConsumer 来延迟设置 size，因为 _update_by_query 和 _delete_by_query
+     * 也使用相同的解析路径，但对 size 参数的处理方式不同。
+     * 
+     * @param request HTTP 请求对象，包含查询参数和请求体
+     * @param client 节点客户端，用于执行内部 Action
+     * @return RestChannelConsumer，在调用时执行搜索并发送响应
+     * @throws IOException 解析请求时可能发生 IO 异常
+     */
     @Override
     public RestChannelConsumer prepareRequest(final RestRequest request, final NodeClient client) throws IOException {
+        // 创建空的搜索请求对象
         SearchRequest searchRequest = new SearchRequest();
         /*
          * We have to pull out the call to `source().size(size)` because
@@ -112,42 +156,68 @@ public class RestSearchAction extends BaseRestHandler {
          * be null later. If that is confusing to you then you are in good
          * company.
          */
+        // 创建一个消费者，用于后续设置搜索结果的大小（size）
         IntConsumer setSize = size -> searchRequest.source().size(size);
+        // 解析请求内容或源参数，填充 searchRequest 对象
         request.withContentOrSourceParamParserOrNull(parser ->
             parseSearchRequest(searchRequest, request, parser, client.getNamedWriteableRegistry(), setSize));
 
+        // 返回一个 lambda，当被调用时执行搜索操作
         return channel -> {
+            // 创建可取消的客户端，支持 HTTP 连接断开时取消搜索
             RestCancellableNodeClient cancelClient = new RestCancellableNodeClient(client, request.getHttpChannel());
+            // 执行搜索 Action：SearchAction.INSTANCE
+            // 这会触发 TransportSearchAction 的执行
             cancelClient.execute(SearchAction.INSTANCE, searchRequest, new RestStatusToXContentListener<>(channel));
         };
     }
 
     /**
-     * Parses the rest request on top of the SearchRequest, preserving values that are not overridden by the rest request.
-     *
-     * @param requestContentParser body of the request to read. This method does not attempt to read the body from the {@code request}
-     *        parameter
-     * @param setSize how the size url parameter is handled. {@code udpate_by_query} and regular search differ here.
+     * 解析 REST 请求并填充 SearchRequest 对象
+     * 
+     * 此方法是搜索请求解析的核心逻辑，负责将 HTTP 请求的各种参数转换为 SearchRequest 的内部表示。
+     * 它会保留 SearchRequest 中已有的值，只覆盖请求中明确指定的参数。
+     * 
+     * 主要解析内容包括：
+     * 1. 索引名称（从 URL 参数）
+     * 2. 请求体中的查询 DSL（JSON/XContent）
+     * 3. 各种 URL 查询参数（from, size, sort, timeout 等）
+     * 4. 滚动搜索参数（scroll）
+     * 5. 路由和偏好设置
+     * 6. 跨集群搜索相关参数
+     * 
+     * @param searchRequest 要填充的搜索请求对象
+     * @param request HTTP 请求对象
+     * @param requestContentParser 请求体的内容解析器（可能为 null，如果请求体为空）
+     * @param namedWriteableRegistry 命名可写对象注册表，用于反序列化
+     * @param setSize size 参数的设置消费者，允许不同的处理方式
+     * @throws IOException 解析过程中可能发生 IO 异常
      */
     public static void parseSearchRequest(SearchRequest searchRequest, RestRequest request,
                                           XContentParser requestContentParser,
                                           NamedWriteableRegistry namedWriteableRegistry,
                                           IntConsumer setSize) throws IOException {
 
+        // 确保 SearchSourceBuilder 已初始化
         if (searchRequest.source() == null) {
             searchRequest.source(new SearchSourceBuilder());
         }
+        // 从 URL 参数中解析索引名称（支持逗号分隔的多个索引）
         searchRequest.indices(Strings.splitStringByCommaToArray(request.param("index")));
+        // 如果请求体不为空，解析查询 DSL
         if (requestContentParser != null) {
             searchRequest.source().parseXContent(requestContentParser, true);
         }
 
+        // 设置批量归约大小（用于优化跨集群搜索的性能）
         final int batchedReduceSize = request.paramAsInt("batched_reduce_size", searchRequest.getBatchedReduceSize());
         searchRequest.setBatchedReduceSize(batchedReduceSize);
+        // 设置预过滤分片大小（控制并行度）
         if (request.hasParam("pre_filter_shard_size")) {
             searchRequest.setPreFilterShardSize(request.paramAsInt("pre_filter_shard_size", SearchRequest.DEFAULT_PRE_FILTER_SHARD_SIZE));
         }
 
+        // 设置最大并发分片请求数（根据集群节点数自动调整）
         if (request.hasParam("max_concurrent_shard_requests")) {
             // only set if we have the parameter since we auto adjust the max concurrency on the coordinator
             // based on the number of nodes in the cluster
@@ -156,14 +226,14 @@ public class RestSearchAction extends BaseRestHandler {
             searchRequest.setMaxConcurrentShardRequests(maxConcurrentShardRequests);
         }
 
+        // 设置是否允许部分搜索结果（某些分片失败时仍返回部分结果）
         if (request.hasParam("allow_partial_search_results")) {
             // only set if we have the parameter passed to override the cluster-level default
             searchRequest.allowPartialSearchResults(request.paramAsBoolean("allow_partial_search_results", null));
         }
 
-        // do not allow 'query_and_fetch' or 'dfs_query_and_fetch' search types
-        // from the REST layer. these modes are an internal optimization and should
-        // not be specified explicitly by the user.
+        // 不允许从 REST 层使用 'query_and_fetch' 或 'dfs_query_and_fetch' 搜索类型
+        // 这些模式是内部优化，不应由用户显式指定
         String searchType = request.param("search_type");
         if ("query_and_fetch".equals(searchType) ||
                 "dfs_query_and_fetch".equals(searchType)) {
@@ -171,24 +241,32 @@ public class RestSearchAction extends BaseRestHandler {
         } else {
             searchRequest.searchType(searchType);
         }
+        // 解析搜索源的其他参数（from, size, sort, timeout 等）
         parseSearchSource(searchRequest.source(), request, setSize);
+        // 设置是否使用请求缓存
         searchRequest.requestCache(request.paramAsBoolean("request_cache", searchRequest.requestCache()));
 
+        // 处理滚动搜索参数
         String scroll = request.param("scroll");
         if (scroll != null) {
             searchRequest.scroll(new Scroll(parseTimeValue(scroll, null, "scroll")));
         }
 
+        // 处理已弃用的类型参数
         if (request.hasParam("type")) {
             deprecationLogger.deprecate("search_with_types", TYPES_DEPRECATION_MESSAGE);
             searchRequest.types(Strings.splitStringByCommaToArray(request.param("type")));
         }
+        // 设置路由值和偏好设置
         searchRequest.routing(request.param("routing"));
         searchRequest.preference(request.param("preference"));
+        // 设置索引选项（如何处理不存在的索引、通配符等）
         searchRequest.indicesOptions(IndicesOptions.fromRequest(request, searchRequest.indicesOptions()));
 
+        // 检查并处理 total_hits 的显示格式
         checkRestTotalHits(request, searchRequest);
 
+        // 处理时间点（Point-in-Time）搜索或跨集群搜索最小化往返
         if (searchRequest.pointInTimeBuilder() != null) {
             preparePointInTime(searchRequest, request, namedWriteableRegistry);
         } else {
@@ -198,8 +276,21 @@ public class RestSearchAction extends BaseRestHandler {
     }
 
     /**
-     * Parses the rest request on top of the SearchSourceBuilder, preserving
-     * values that are not overridden by the rest request.
+     * 解析 SearchSourceBuilder 的各种参数
+     * 
+     * 此方法处理所有与搜索源相关的 URL 参数，包括：
+     * - 查询参数（q 参数）
+     * - 分页参数（from, size）
+     * - 解释和版本信息（explain, version, seq_no_primary_term）
+     * - 超时和终止条件（timeout, terminate_after）
+     * - 字段选择（stored_fields, docvalue_fields, _source）
+     * - 排序参数（sort）
+     * - 统计和跟踪参数（stats, track_scores, track_total_hits）
+     * - 建议器参数（suggest_field, suggest_text 等）
+     * 
+     * @param searchSourceBuilder 要填充的搜索源构建器
+     * @param request HTTP 请求对象
+     * @param setSize size 参数的设置消费者
      */
     private static void parseSearchSource(final SearchSourceBuilder searchSourceBuilder, RestRequest request, IntConsumer setSize) {
         QueryBuilder queryBuilder = RestActions.urlParamsToQueryBuilder(request);

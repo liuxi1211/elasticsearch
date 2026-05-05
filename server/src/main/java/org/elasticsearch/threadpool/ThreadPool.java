@@ -60,36 +60,46 @@ import java.util.stream.Collectors;
 
 import static java.util.Collections.unmodifiableMap;
 
+/**
+ * Elasticsearch 线程池管理类，是 ES 中处理并发任务的核心组件
+ * 负责管理多种类型的线程池，支持任务调度、执行和监控
+ */
 public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
 
     private static final Logger logger = LogManager.getLogger(ThreadPool.class);
 
+    /**
+     * 线程池名称常量类，定义了 ES 中所有内置线程池的名称
+     */
     public static class Names {
-        public static final String SAME = "same";
-        public static final String GENERIC = "generic";
+        public static final String SAME = "same";                    // 直接在当前线程执行
+        public static final String GENERIC = "generic";              // 通用线程池，处理各种通用任务
         @Deprecated public static final String LISTENER = "listener";
-        public static final String GET = "get";
-        public static final String ANALYZE = "analyze";
-        public static final String WRITE = "write";
-        public static final String SEARCH = "search";
-        public static final String SEARCH_THROTTLED = "search_throttled";
-        public static final String MANAGEMENT = "management";
-        public static final String FLUSH = "flush";
-        public static final String REFRESH = "refresh";
-        public static final String WARMER = "warmer";
-        public static final String SNAPSHOT = "snapshot";
-        public static final String FORCE_MERGE = "force_merge";
+        public static final String GET = "get";                      // GET 请求处理
+        public static final String ANALYZE = "analyze";              // 分析任务
+        public static final String WRITE = "write";                  // 写操作（索引、更新等）
+        public static final String SEARCH = "search";                // 搜索操作
+        public static final String SEARCH_THROTTLED = "search_throttled"; // 限流搜索
+        public static final String MANAGEMENT = "management";        // 管理任务
+        public static final String FLUSH = "flush";                  // 刷盘操作
+        public static final String REFRESH = "refresh";              // 刷新操作
+        public static final String WARMER = "warmer";                // 预热操作
+        public static final String SNAPSHOT = "snapshot";            // 快照操作
+        public static final String FORCE_MERGE = "force_merge";      // 强制合并
         public static final String FETCH_SHARD_STARTED = "fetch_shard_started";
         public static final String FETCH_SHARD_STORE = "fetch_shard_store";
-        public static final String SYSTEM_READ = "system_read";
-        public static final String SYSTEM_WRITE = "system_write";
+        public static final String SYSTEM_READ = "system_read";      // 系统读操作
+        public static final String SYSTEM_WRITE = "system_write";    // 系统写操作
     }
 
+    /**
+     * 线程池类型枚举
+     */
     public enum ThreadPoolType {
-        DIRECT("direct"),
-        FIXED("fixed"),
-        FIXED_AUTO_QUEUE_SIZE("fixed_auto_queue_size"),
-        SCALING("scaling");
+        DIRECT("direct"),                    // 直接执行，不使用线程池
+        FIXED("fixed"),                      // 固定大小线程池
+        FIXED_AUTO_QUEUE_SIZE("fixed_auto_queue_size"), // 固定大小但队列大小自动调整
+        SCALING("scaling");                  // 可伸缩线程池
 
         private final String type;
 
@@ -120,6 +130,9 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
     }
 
+    /**
+     * 线程池名称到类型的映射表
+     */
     public static final Map<String, ThreadPoolType> THREAD_POOL_TYPES;
 
     static {
@@ -145,19 +158,19 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         THREAD_POOL_TYPES = Collections.unmodifiableMap(map);
     }
 
-    private final Map<String, ExecutorHolder> executors;
+    private final Map<String, ExecutorHolder> executors;              // 线程池名称到执行器的映射
 
-    private final ThreadPoolInfo threadPoolInfo;
+    private final ThreadPoolInfo threadPoolInfo;                     // 线程池信息
 
-    private final CachedTimeThread cachedTimeThread;
+    private final CachedTimeThread cachedTimeThread;                 // 缓存时间的线程
 
-    static final ExecutorService DIRECT_EXECUTOR = EsExecutors.newDirectExecutorService();
+    static final ExecutorService DIRECT_EXECUTOR = EsExecutors.newDirectExecutorService(); // 直接执行器
 
-    private final ThreadContext threadContext;
+    private final ThreadContext threadContext;                       // 线程上下文
 
-    private final Map<String, ExecutorBuilder> builders;
+    private final Map<String, ExecutorBuilder> builders;             // 执行器构建器
 
-    private final ScheduledThreadPoolExecutor scheduler;
+    private final ScheduledThreadPoolExecutor scheduler;             // 调度线程池，用于定时任务
 
     public Collection<ExecutorBuilder> builders() {
         return Collections.unmodifiableCollection(builders.values());
@@ -167,14 +180,21 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         Setting.timeSetting("thread_pool.estimated_time_interval",
             TimeValue.timeValueMillis(200), TimeValue.ZERO, Setting.Property.NodeScope);
 
+    /**
+     * 构造函数：初始化线程池
+     * @param settings 配置信息
+     * @param customBuilders 自定义执行器构建器
+     */
     public ThreadPool(final Settings settings, final ExecutorBuilder<?>... customBuilders) {
         assert Node.NODE_NAME_SETTING.exists(settings);
 
         final Map<String, ExecutorBuilder> builders = new HashMap<>();
-        final int allocatedProcessors = EsExecutors.allocatedProcessors(settings);
+        final int allocatedProcessors = EsExecutors.allocatedProcessors(settings);  // 获取分配的处理器数量
         final int halfProcMaxAt5 = halfAllocatedProcessorsMaxFive(allocatedProcessors);
         final int halfProcMaxAt10 = halfAllocatedProcessorsMaxTen(allocatedProcessors);
         final int genericThreadPoolMax = boundedBy(4 * allocatedProcessors, 128, 512);
+        
+        // 初始化各种类型的线程池构建器
         builders.put(Names.GENERIC, new ScalingExecutorBuilder(Names.GENERIC, 4, genericThreadPoolMax, TimeValue.timeValueSeconds(30)));
         builders.put(Names.WRITE, new FixedExecutorBuilder(settings, Names.WRITE, allocatedProcessors, 10000));
         builders.put(Names.GET, new FixedExecutorBuilder(settings, Names.GET, allocatedProcessors, 1000));
@@ -184,8 +204,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         builders.put(Names.SEARCH_THROTTLED, new AutoQueueAdjustingExecutorBuilder(settings,
             Names.SEARCH_THROTTLED, 1, 100, 100, 100, 200));
         builders.put(Names.MANAGEMENT, new ScalingExecutorBuilder(Names.MANAGEMENT, 1, 5, TimeValue.timeValueMinutes(5)));
-        // no queue as this means clients will need to handle rejections on listener queue even if the operation succeeded
-        // the assumption here is that the listeners should be very lightweight on the listeners side
+        // listener 线程池没有队列，假设监听器应该很轻量
         builders.put(Names.LISTENER, new FixedExecutorBuilder(settings, Names.LISTENER, halfProcMaxAt10, -1, true));
         builders.put(Names.FLUSH, new ScalingExecutorBuilder(Names.FLUSH, 1, halfProcMaxAt5, TimeValue.timeValueMinutes(5)));
         builders.put(Names.REFRESH, new ScalingExecutorBuilder(Names.REFRESH, 1, halfProcMaxAt10, TimeValue.timeValueMinutes(5)));
@@ -199,6 +218,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         builders.put(Names.SYSTEM_READ, new FixedExecutorBuilder(settings, Names.SYSTEM_READ, halfProcMaxAt5, 2000, false));
         builders.put(Names.SYSTEM_WRITE, new FixedExecutorBuilder(settings, Names.SYSTEM_WRITE, halfProcMaxAt5, 1000, false));
 
+        // 处理自定义构建器
         for (final ExecutorBuilder<?> builder : customBuilders) {
             if (builders.containsKey(builder.name())) {
                 throw new IllegalArgumentException("builder with name [" + builder.name() + "] already exists");
@@ -209,6 +229,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
 
         threadContext = new ThreadContext(settings);
 
+        // 构建所有线程池
         final Map<String, ExecutorHolder> executors = new HashMap<>();
         for (final Map.Entry<String, ExecutorBuilder> entry : builders.entrySet()) {
             final ExecutorBuilder.ExecutorSettings executorSettings = entry.getValue().getSettings(settings);
@@ -220,9 +241,11 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
             executors.put(entry.getKey(), executorHolder);
         }
 
+        // 添加 SAME 线程池（直接执行）
         executors.put(Names.SAME, new ExecutorHolder(DIRECT_EXECUTOR, new Info(Names.SAME, ThreadPoolType.DIRECT)));
         this.executors = unmodifiableMap(executors);
 
+        // 收集线程池信息
         final List<Info> infos =
                 executors
                         .values()
@@ -231,6 +254,8 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
                         .map(holder -> holder.info)
                         .collect(Collectors.toList());
         this.threadPoolInfo = new ThreadPoolInfo(infos);
+        
+        // 初始化调度器和缓存时间线程
         this.scheduler = Scheduler.initScheduler(settings);
         TimeValue estimatedTimeInterval = ESTIMATED_TIME_INTERVAL_SETTING.get(settings);
         this.cachedTimeThread = new CachedTimeThread(EsExecutors.threadName(settings, "[timer]"), estimatedTimeInterval.millis());
@@ -238,31 +263,23 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
     }
 
     /**
-     * Returns a value of milliseconds that may be used for relative time calculations.
-     *
-     * This method should only be used for calculating time deltas. For an epoch based
-     * timestamp, see {@link #absoluteTimeInMillis()}.
+     * 返回相对时间（毫秒），用于计算时间差
+     * 不要用于获取绝对时间戳
      */
     public long relativeTimeInMillis() {
         return TimeValue.nsecToMSec(relativeTimeInNanos());
     }
 
     /**
-     * Returns a value of nanoseconds that may be used for relative time calculations.
-     *
-     * This method should only be used for calculating time deltas. For an epoch based
-     * timestamp, see {@link #absoluteTimeInMillis()}.
+     * 返回相对时间（纳秒），用于计算时间差
      */
     public long relativeTimeInNanos() {
         return cachedTimeThread.relativeTimeInNanos();
     }
 
     /**
-     * Returns the value of milliseconds since UNIX epoch.
-     *
-     * This method should only be used for exact date/time formatting. For calculating
-     * time deltas that should not suffer from negative deltas, which are possible with
-     * this method, see {@link #relativeTimeInMillis()}.
+     * 返回绝对时间（从 Unix 纪元开始的毫秒数）
+     * 用于日期时间格式化，不要用于计算时间差
      */
     public long absoluteTimeInMillis() {
         return cachedTimeThread.absoluteTimeInMillis();
@@ -273,6 +290,9 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         return threadPoolInfo;
     }
 
+    /**
+     * 获取指定名称的线程池信息
+     */
     public Info info(String name) {
         ExecutorHolder holder = executors.get(name);
         if (holder == null) {
@@ -281,11 +301,14 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         return holder.info;
     }
 
+    /**
+     * 获取所有线程池的统计信息
+     */
     public ThreadPoolStats stats() {
         List<ThreadPoolStats.Stats> stats = new ArrayList<>();
         for (ExecutorHolder holder : executors.values()) {
             final String name = holder.info.getName();
-            // no need to have info on "same" thread pool
+            // 忽略 "same" 线程池
             if ("same".equals(name)) {
                 continue;
             }
@@ -297,14 +320,14 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
             long completed = -1;
             if (holder.executor() instanceof ThreadPoolExecutor) {
                 ThreadPoolExecutor threadPoolExecutor = (ThreadPoolExecutor) holder.executor();
-                threads = threadPoolExecutor.getPoolSize();
-                queue = threadPoolExecutor.getQueue().size();
-                active = threadPoolExecutor.getActiveCount();
-                largest = threadPoolExecutor.getLargestPoolSize();
-                completed = threadPoolExecutor.getCompletedTaskCount();
+                threads = threadPoolExecutor.getPoolSize();           // 当前线程数
+                queue = threadPoolExecutor.getQueue().size();         // 队列大小
+                active = threadPoolExecutor.getActiveCount();         // 活跃线程数
+                largest = threadPoolExecutor.getLargestPoolSize();    // 历史最大线程数
+                completed = threadPoolExecutor.getCompletedTaskCount(); // 已完成任务数
                 RejectedExecutionHandler rejectedExecutionHandler = threadPoolExecutor.getRejectedExecutionHandler();
                 if (rejectedExecutionHandler instanceof XRejectedExecutionHandler) {
-                    rejected = ((XRejectedExecutionHandler) rejectedExecutionHandler).rejected();
+                    rejected = ((XRejectedExecutionHandler) rejectedExecutionHandler).rejected(); // 拒绝的任务数
                 }
             }
             stats.add(new ThreadPoolStats.Stats(name, threads, queue, active, rejected, largest, completed));
@@ -313,27 +336,17 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
     }
 
     /**
-     * Get the generic {@link ExecutorService}. This executor service
-     * {@link Executor#execute(Runnable)} method will run the {@link Runnable} it is given in the
-     * {@link ThreadContext} of the thread that queues it.
-     * <p>
-     * Warning: this {@linkplain ExecutorService} will not throw {@link RejectedExecutionException}
-     * if you submit a task while it shutdown. It will instead silently queue it and not run it.
+     * 获取通用线程池
      */
     public ExecutorService generic() {
         return executor(Names.GENERIC);
     }
 
     /**
-     * Get the {@link ExecutorService} with the given name. This executor service's
-     * {@link Executor#execute(Runnable)} method will run the {@link Runnable} it is given in the
-     * {@link ThreadContext} of the thread that queues it.
-     * <p>
-     * Warning: this {@linkplain ExecutorService} might not throw {@link RejectedExecutionException}
-     * if you submit a task while it shutdown. It will instead silently queue it and not run it.
-     *
-     * @param name the name of the executor service to obtain
-     * @throws IllegalArgumentException if no executor service with the specified name exists
+     * 获取指定名称的线程池
+     * @param name 线程池名称
+     * @return 对应的执行器服务
+     * @throws IllegalArgumentException 如果指定名称的线程池不存在
      */
     public ExecutorService executor(String name) {
         final ExecutorHolder holder = executors.get(name);
@@ -344,21 +357,15 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
     }
 
     /**
-     * Schedules a one-shot command to run after a given delay. The command is run in the context of the calling thread.
-     *
-     * @param command the command to run
-     * @param delay delay before the task executes
-     * @param executor the name of the thread pool on which to execute this task. SAME means "execute on the scheduler thread" which changes
-     *        the meaning of the ScheduledFuture returned by this method. In that case the ScheduledFuture will complete only when the
-     *        command completes.
-     * @return a ScheduledFuture who's get will return when the task is has been added to its target thread pool and throw an exception if
-     *         the task is canceled before it was added to its target thread pool. Once the task has been added to its target thread pool
-     *         the ScheduledFuture will cannot interact with it.
-     * @throws org.elasticsearch.common.util.concurrent.EsRejectedExecutionException if the task cannot be scheduled for execution
+     * 调度一个延迟执行的一次性任务
+     * @param command 要执行的任务
+     * @param delay 延迟时间
+     * @param executor 执行任务的线程池名称，SAME 表示在调度线程上执行
+     * @return 可取消的调度任务
      */
     @Override
     public ScheduledCancellable schedule(Runnable command, TimeValue delay, String executor) {
-        command = threadContext.preserveContext(command);
+        command = threadContext.preserveContext(command);  // 保留线程上下文
         if (!Names.SAME.equals(executor)) {
             command = new ThreadedRunnable(command, executor(executor));
         }
@@ -396,6 +403,9 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         cachedTimeThread.interrupt();
     }
 
+    /**
+     * 优雅关闭线程池，允许已提交的任务继续执行
+     */
     public void shutdown() {
         stopCachedTimeThread();
         scheduler.shutdown();
@@ -406,6 +416,9 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
     }
 
+    /**
+     * 立即关闭线程池，尝试停止所有正在执行的任务
+     */
     public void shutdownNow() {
         stopCachedTimeThread();
         scheduler.shutdownNow();
@@ -416,6 +429,12 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
     }
 
+    /**
+     * 等待线程池终止
+     * @param timeout 超时时间
+     * @param unit 时间单位
+     * @return 是否在超时前终止
+     */
     public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
         boolean result = scheduler.awaitTermination(timeout, unit);
         for (ExecutorHolder executor : executors.values()) {
@@ -537,32 +556,26 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
     }
 
     /**
-     * A thread to cache millisecond time values from
-     * {@link System#nanoTime()} and {@link System#currentTimeMillis()}.
-     *
-     * The values are updated at a specified interval.
+     * 缓存时间的线程，定期更新相对时间和绝对时间
+     * 避免频繁调用 System.currentTimeMillis() 和 System.nanoTime()
      */
     static class CachedTimeThread extends Thread {
 
-        final long interval;
-        volatile boolean running = true;
-        volatile long relativeNanos;
-        volatile long absoluteMillis;
+        final long interval;              // 更新间隔
+        volatile boolean running = true;  // 运行标志
+        volatile long relativeNanos;      // 缓存的相对时间（纳秒）
+        volatile long absoluteMillis;     // 缓存的绝对时间（毫秒）
 
         CachedTimeThread(String name, long interval) {
             super(name);
             this.interval = interval;
             this.relativeNanos = System.nanoTime();
             this.absoluteMillis = System.currentTimeMillis();
-            setDaemon(true);
+            setDaemon(true);  // 设置为守护线程
         }
 
         /**
-         * Return the current time used for relative calculations. This is {@link System#nanoTime()}.
-         * <p>
-         * If {@link ThreadPool#ESTIMATED_TIME_INTERVAL_SETTING} is set to 0
-         * then the cache is disabled and the method calls {@link System#nanoTime()}
-         * whenever called. Typically used for testing.
+         * 获取相对时间（纳秒）
          */
         long relativeTimeInNanos() {
             if (0 < interval) {
@@ -572,12 +585,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
 
         /**
-         * Return the current epoch time, used to find absolute time. This is
-         * a cached version of {@link System#currentTimeMillis()}.
-         * <p>
-         * If {@link ThreadPool#ESTIMATED_TIME_INTERVAL_SETTING} is set to 0
-         * then the cache is disabled and the method calls {@link System#currentTimeMillis()}
-         * whenever called. Typically used for testing.
+         * 获取绝对时间（毫秒）
          */
         long absoluteTimeInMillis() {
             if (0 < interval) {
@@ -592,7 +600,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
                 relativeNanos = System.nanoTime();
                 absoluteMillis = System.currentTimeMillis();
                 try {
-                    Thread.sleep(interval);
+                    Thread.sleep(interval);  // 等待指定间隔
                 } catch (InterruptedException e) {
                     running = false;
                     return;
@@ -601,6 +609,9 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
     }
 
+    /**
+     * 执行器持有者，封装执行器和其信息
+     */
     static class ExecutorHolder {
         private final ExecutorService executor;
         public final Info info;
@@ -616,14 +627,17 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         }
     }
 
+    /**
+     * 线程池信息类，包含线程池的配置信息
+     */
     public static class Info implements Writeable, ToXContentFragment {
 
-        private final String name;
-        private final ThreadPoolType type;
-        private final int min;
-        private final int max;
-        private final TimeValue keepAlive;
-        private final SizeValue queueSize;
+        private final String name;           // 线程池名称
+        private final ThreadPoolType type;   // 线程池类型
+        private final int min;               // 最小线程数
+        private final int max;               // 最大线程数
+        private final TimeValue keepAlive;   // 线程空闲存活时间
+        private final SizeValue queueSize;   // 队列大小
 
         public Info(String name, ThreadPoolType type) {
             this(name, type, -1);

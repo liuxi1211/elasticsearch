@@ -406,28 +406,66 @@ import java.util.stream.Stream;
 import static java.util.Collections.unmodifiableMap;
 
 /**
- * Builds and binds the generic action map, all {@link TransportAction}s, and {@link ActionFilters}.
+ * 构建并绑定通用的 Action 映射、所有的 {@link TransportAction} 以及 {@link ActionFilters}。
+ * 
+ * ActionModule 是 Elasticsearch 中非常重要的核心模块，主要职责包括：
+ * 1. 注册所有的 Action（包括内置和插件提供的）
+ * 2. 初始化 REST 控制器和 REST 处理器
+ * 3. 配置 Action 过滤器链
+ * 4. 管理依赖注入绑定
+ * 5. 处理自动创建索引、破坏性操作等配置
  */
 public class ActionModule extends AbstractModule {
 
     private static final Logger logger = LogManager.getLogger(ActionModule.class);
 
+    /** 是否为传输客户端模式 */
     private final boolean transportClient;
+    /** 全局配置 */
     private final Settings settings;
+    /** 索引名称表达式解析器，用于解析索引名模式（如通配符） */
     private final IndexNameExpressionResolver indexNameExpressionResolver;
+    /** 索引范围的配置 */
     private final IndexScopedSettings indexScopedSettings;
+    /** 集群配置 */
     private final ClusterSettings clusterSettings;
+    /** 配置过滤器，用于过滤敏感配置信息 */
     private final SettingsFilter settingsFilter;
+    /** 所有 Action 插件列表 */
     private final List<ActionPlugin> actionPlugins;
+    /** Action 名称到 ActionHandler 的映射，存储所有注册的 Action */
     private final Map<String, ActionHandler<?, ?>> actions;
+    /** Action 过滤器链，用于在 Action 执行前后进行拦截处理 */
     private final ActionFilters actionFilters;
+    /** 自动创建索引功能，控制索引是否可以自动创建 */
     private final AutoCreateIndex autoCreateIndex;
+    /** 破坏性操作控制，限制可能导致数据丢失的操作 */
     private final DestructiveOperations destructiveOperations;
+    /** REST 控制器，用于管理和路由 REST 请求 */
     private final RestController restController;
+    /** 映射更新请求验证器 */
     private final RequestValidators<PutMappingRequest> mappingRequestValidators;
+    /** 索引别名请求验证器 */
     private final RequestValidators<IndicesAliasesRequest> indicesAliasesRequestRequestValidators;
+    /** 线程池，用于异步执行任务 */
     private final ThreadPool threadPool;
 
+    /**
+     * 构造函数，初始化 ActionModule
+     * 
+     * @param transportClient 是否为传输客户端模式
+     * @param settings 全局配置
+     * @param indexNameExpressionResolver 索引名称表达式解析器
+     * @param indexScopedSettings 索引范围配置
+     * @param clusterSettings 集群配置
+     * @param settingsFilter 配置过滤器
+     * @param threadPool 线程池
+     * @param actionPlugins Action 插件列表
+     * @param nodeClient 节点客户端
+     * @param circuitBreakerService 熔断器服务
+     * @param usageService 使用统计服务
+     * @param systemIndices 系统索引
+     */
     public ActionModule(boolean transportClient, Settings settings, IndexNameExpressionResolver indexNameExpressionResolver,
                         IndexScopedSettings indexScopedSettings, ClusterSettings clusterSettings, SettingsFilter settingsFilter,
                         ThreadPool threadPool, List<ActionPlugin> actionPlugins, NodeClient nodeClient,
@@ -440,16 +478,22 @@ public class ActionModule extends AbstractModule {
         this.settingsFilter = settingsFilter;
         this.actionPlugins = actionPlugins;
         this.threadPool = threadPool;
+        // 初始化所有 Action（包括内置和插件提供的）
         actions = setupActions(actionPlugins);
+        // 初始化 Action 过滤器
         actionFilters = setupActionFilters(actionPlugins);
+        // 初始化自动创建索引功能（仅非传输客户端模式）
         autoCreateIndex = transportClient
             ? null
             : new AutoCreateIndex(settings, clusterSettings, indexNameExpressionResolver, systemIndices);
+        // 初始化破坏性操作控制
         destructiveOperations = new DestructiveOperations(settings, clusterSettings);
+        // 收集所有 REST 头定义
         Set<RestHeaderDefinition> headers = Stream.concat(
             actionPlugins.stream().flatMap(p -> p.getRestHeaders().stream()),
             Stream.of(new RestHeaderDefinition(Task.X_OPAQUE_ID, false))
         ).collect(Collectors.toSet());
+        // 收集 REST 处理器包装器（最多一个）
         UnaryOperator<RestHandler> restWrapper = null;
         for (ActionPlugin plugin : actionPlugins) {
             UnaryOperator<RestHandler> newRestWrapper = plugin.getRestHandlerWrapper(threadPool.getThreadContext());
@@ -461,11 +505,13 @@ public class ActionModule extends AbstractModule {
                 restWrapper = newRestWrapper;
             }
         }
+        // 初始化请求验证器
         mappingRequestValidators = new RequestValidators<>(
             actionPlugins.stream().flatMap(p -> p.mappingRequestValidators().stream()).collect(Collectors.toList()));
         indicesAliasesRequestRequestValidators = new RequestValidators<>(
                 actionPlugins.stream().flatMap(p -> p.indicesAliasesRequestValidators().stream()).collect(Collectors.toList()));
 
+        // 初始化 REST 控制器（仅非传输客户端模式）
         if (transportClient) {
             restController = null;
         } else {
@@ -474,21 +520,48 @@ public class ActionModule extends AbstractModule {
     }
 
 
+    /**
+     * 获取所有注册的 Action
+     * 
+     * @return Action 名称到 ActionHandler 的映射
+     */
     public Map<String, ActionHandler<?, ?>> getActions() {
         return actions;
     }
 
+    /**
+     * 设置并注册所有的 Action（包括内置和插件提供的）
+     * 
+     * 这是 ActionModule 的核心方法之一，负责：
+     * 1. 创建 Action 注册表
+     * 2. 注册所有内置的 Action
+     * 3. 注册插件提供的 Action
+     * 4. 返回不可修改的 Action 映射
+     * 
+     * @param actionPlugins Action 插件列表
+     * @return Action 名称到 ActionHandler 的不可修改映射
+     */
     static Map<String, ActionHandler<?, ?>> setupActions(List<ActionPlugin> actionPlugins) {
-        // Subclass NamedRegistry for easy registration
+        // 继承 NamedRegistry 以便于注册
         class ActionRegistry extends NamedRegistry<ActionHandler<?, ?>> {
             ActionRegistry() {
                 super("action");
             }
 
+            /**
+             * 注册 ActionHandler
+             */
             public void register(ActionHandler<?, ?> handler) {
                 register(handler.getAction().name(), handler);
             }
 
+            /**
+             * 注册 ActionType 和对应的 TransportAction
+             * 
+             * @param action Action 类型
+             * @param transportAction 传输 Action 类
+             * @param supportTransportActions 支持的传输 Action 类
+             */
             public <Request extends ActionRequest, Response extends ActionResponse> void register(
                 ActionType<Response> action, Class<? extends TransportAction<Request, Response>> transportAction,
                 Class<?>... supportTransportActions) {
@@ -497,154 +570,289 @@ public class ActionModule extends AbstractModule {
         }
         ActionRegistry actions = new ActionRegistry();
 
+        // ========== 节点和任务相关 Action ==========
+        // 主信息 Action
         actions.register(MainAction.INSTANCE, TransportMainAction.class);
+        // 节点信息 Action
         actions.register(NodesInfoAction.INSTANCE, TransportNodesInfoAction.class);
+        // 远程集群信息 Action
         actions.register(RemoteInfoAction.INSTANCE, TransportRemoteInfoAction.class);
+        // 节点统计 Action
         actions.register(NodesStatsAction.INSTANCE, TransportNodesStatsAction.class);
+        // 节点使用情况 Action
         actions.register(NodesUsageAction.INSTANCE, TransportNodesUsageAction.class);
+        // 节点热点线程 Action
         actions.register(NodesHotThreadsAction.INSTANCE, TransportNodesHotThreadsAction.class);
+        // 任务列表 Action
         actions.register(ListTasksAction.INSTANCE, TransportListTasksAction.class);
+        // 获取任务 Action
         actions.register(GetTaskAction.INSTANCE, TransportGetTaskAction.class);
+        // 取消任务 Action
         actions.register(CancelTasksAction.INSTANCE, TransportCancelTasksAction.class);
 
+        // ========== 集群管理 Action ==========
+        // 添加投票配置排除项 Action
         actions.register(AddVotingConfigExclusionsAction.INSTANCE, TransportAddVotingConfigExclusionsAction.class);
+        // 清除投票配置排除项 Action
         actions.register(ClearVotingConfigExclusionsAction.INSTANCE, TransportClearVotingConfigExclusionsAction.class);
+        // 集群分配解释 Action
         actions.register(ClusterAllocationExplainAction.INSTANCE, TransportClusterAllocationExplainAction.class);
+        // 集群统计 Action
         actions.register(ClusterStatsAction.INSTANCE, TransportClusterStatsAction.class);
+        // 集群状态 Action
         actions.register(ClusterStateAction.INSTANCE, TransportClusterStateAction.class);
+        // 集群健康 Action
         actions.register(ClusterHealthAction.INSTANCE, TransportClusterHealthAction.class);
+        // 集群更新配置 Action
         actions.register(ClusterUpdateSettingsAction.INSTANCE, TransportClusterUpdateSettingsAction.class);
+        // 集群重路由 Action
         actions.register(ClusterRerouteAction.INSTANCE, TransportClusterRerouteAction.class);
+        // 集群搜索分片 Action
         actions.register(ClusterSearchShardsAction.INSTANCE, TransportClusterSearchShardsAction.class);
+        // 待处理集群任务 Action
         actions.register(PendingClusterTasksAction.INSTANCE, TransportPendingClusterTasksAction.class);
+        // ========== 快照仓库 Action ==========
+        // 创建仓库 Action
         actions.register(PutRepositoryAction.INSTANCE, TransportPutRepositoryAction.class);
+        // 获取仓库 Action
         actions.register(GetRepositoriesAction.INSTANCE, TransportGetRepositoriesAction.class);
+        // 删除仓库 Action
         actions.register(DeleteRepositoryAction.INSTANCE, TransportDeleteRepositoryAction.class);
+        // 验证仓库 Action
         actions.register(VerifyRepositoryAction.INSTANCE, TransportVerifyRepositoryAction.class);
+        // 清理仓库 Action
         actions.register(CleanupRepositoryAction.INSTANCE, TransportCleanupRepositoryAction.class);
+        // ========== 快照管理 Action ==========
+        // 获取快照 Action
         actions.register(GetSnapshotsAction.INSTANCE, TransportGetSnapshotsAction.class);
+        // 删除快照 Action
         actions.register(DeleteSnapshotAction.INSTANCE, TransportDeleteSnapshotAction.class);
+        // 创建快照 Action
         actions.register(CreateSnapshotAction.INSTANCE, TransportCreateSnapshotAction.class);
+        // 克隆快照 Action
         actions.register(CloneSnapshotAction.INSTANCE, TransportCloneSnapshotAction.class);
+        // 恢复快照 Action
         actions.register(RestoreSnapshotAction.INSTANCE, TransportRestoreSnapshotAction.class);
+        // 快照状态 Action
         actions.register(SnapshotsStatusAction.INSTANCE, TransportSnapshotsStatusAction.class);
 
+        // ========== 索引管理 Action ==========
+        // 索引统计 Action
         actions.register(IndicesStatsAction.INSTANCE, TransportIndicesStatsAction.class);
+        // 索引段 Action
         actions.register(IndicesSegmentsAction.INSTANCE, TransportIndicesSegmentsAction.class);
+        // 索引分片存储 Action
         actions.register(IndicesShardStoresAction.INSTANCE, TransportIndicesShardStoresAction.class);
+        // 创建索引 Action
         actions.register(CreateIndexAction.INSTANCE, TransportCreateIndexAction.class);
+        // 调整索引大小（收缩/拆分/克隆）Action
         actions.register(ResizeAction.INSTANCE, TransportResizeAction.class);
+        // 索引滚动 Action
         actions.register(RolloverAction.INSTANCE, TransportRolloverAction.class);
+        // 删除索引 Action
         actions.register(DeleteIndexAction.INSTANCE, TransportDeleteIndexAction.class);
+        // 获取索引 Action
         actions.register(GetIndexAction.INSTANCE, TransportGetIndexAction.class);
+        // 打开索引 Action
         actions.register(OpenIndexAction.INSTANCE, TransportOpenIndexAction.class);
+        // 关闭索引 Action
         actions.register(CloseIndexAction.INSTANCE, TransportCloseIndexAction.class);
+        // 索引存在检查 Action
         actions.register(IndicesExistsAction.INSTANCE, TransportIndicesExistsAction.class);
+        // 类型存在检查 Action
         actions.register(TypesExistsAction.INSTANCE, TransportTypesExistsAction.class);
+        // 添加索引块 Action
         actions.register(AddIndexBlockAction.INSTANCE, TransportAddIndexBlockAction.class);
+        // ========== 映射管理 Action ==========
+        // 获取映射 Action
         actions.register(GetMappingsAction.INSTANCE, TransportGetMappingsAction.class);
+        // 获取字段映射 Action
         actions.register(GetFieldMappingsAction.INSTANCE, TransportGetFieldMappingsAction.class,
                 TransportGetFieldMappingsIndexAction.class);
+        // 更新映射 Action
         actions.register(PutMappingAction.INSTANCE, TransportPutMappingAction.class);
+        // 自动更新映射 Action
         actions.register(AutoPutMappingAction.INSTANCE, TransportAutoPutMappingAction.class);
+        // ========== 索引别名和配置 Action ==========
+        // 索引别名 Action
         actions.register(IndicesAliasesAction.INSTANCE, TransportIndicesAliasesAction.class);
+        // 更新索引配置 Action
         actions.register(UpdateSettingsAction.INSTANCE, TransportUpdateSettingsAction.class);
+        // 分析 Action
         actions.register(AnalyzeAction.INSTANCE, TransportAnalyzeAction.class);
+        // ========== 索引模板 Action ==========
+        // 创建索引模板 Action
         actions.register(PutIndexTemplateAction.INSTANCE, TransportPutIndexTemplateAction.class);
+        // 获取索引模板 Action
         actions.register(GetIndexTemplatesAction.INSTANCE, TransportGetIndexTemplatesAction.class);
+        // 删除索引模板 Action
         actions.register(DeleteIndexTemplateAction.INSTANCE, TransportDeleteIndexTemplateAction.class);
+        // 创建组件模板 Action
         actions.register(PutComponentTemplateAction.INSTANCE, TransportPutComponentTemplateAction.class);
+        // 获取组件模板 Action
         actions.register(GetComponentTemplateAction.INSTANCE, TransportGetComponentTemplateAction.class);
+        // 删除组件模板 Action
         actions.register(DeleteComponentTemplateAction.INSTANCE, TransportDeleteComponentTemplateAction.class);
+        // 创建组合索引模板 Action
         actions.register(PutComposableIndexTemplateAction.INSTANCE, TransportPutComposableIndexTemplateAction.class);
+        // 获取组合索引模板 Action
         actions.register(GetComposableIndexTemplateAction.INSTANCE, TransportGetComposableIndexTemplateAction.class);
+        // 删除组合索引模板 Action
         actions.register(DeleteComposableIndexTemplateAction.INSTANCE, TransportDeleteComposableIndexTemplateAction.class);
+        // 模拟索引模板 Action
         actions.register(SimulateIndexTemplateAction.INSTANCE, TransportSimulateIndexTemplateAction.class);
+        // 模拟模板 Action
         actions.register(SimulateTemplateAction.INSTANCE, TransportSimulateTemplateAction.class);
+        // ========== 查询验证和索引操作 Action ==========
+        // 验证查询 Action
         actions.register(ValidateQueryAction.INSTANCE, TransportValidateQueryAction.class);
+        // 刷新索引 Action
         actions.register(RefreshAction.INSTANCE, TransportRefreshAction.class);
+        // 刷新索引到磁盘 Action
         actions.register(FlushAction.INSTANCE, TransportFlushAction.class);
+        // 同步刷新 Action
         actions.register(SyncedFlushAction.INSTANCE, TransportSyncedFlushAction.class);
+        // 强制合并 Action
         actions.register(ForceMergeAction.INSTANCE, TransportForceMergeAction.class);
+        // 升级 Action
         actions.register(UpgradeAction.INSTANCE, TransportUpgradeAction.class);
+        // 升级状态 Action
         actions.register(UpgradeStatusAction.INSTANCE, TransportUpgradeStatusAction.class);
+        // 升级配置 Action
         actions.register(UpgradeSettingsAction.INSTANCE, TransportUpgradeSettingsAction.class);
+        // 清除索引缓存 Action
         actions.register(ClearIndicesCacheAction.INSTANCE, TransportClearIndicesCacheAction.class);
+        // ========== 别名和配置获取 Action ==========
+        // 获取别名 Action
         actions.register(GetAliasesAction.INSTANCE, TransportGetAliasesAction.class);
+        // 别名存在检查 Action
         actions.register(AliasesExistAction.INSTANCE, TransportAliasesExistAction.class);
+        // 获取配置 Action
         actions.register(GetSettingsAction.INSTANCE, TransportGetSettingsAction.class);
 
+        // ========== 文档操作 Action ==========
+        // 索引文档 Action
         actions.register(IndexAction.INSTANCE, TransportIndexAction.class);
+        // 获取文档 Action
         actions.register(GetAction.INSTANCE, TransportGetAction.class);
+        // 词向量 Action
         actions.register(TermVectorsAction.INSTANCE, TransportTermVectorsAction.class);
+        // 批量词向量 Action
         actions.register(MultiTermVectorsAction.INSTANCE, TransportMultiTermVectorsAction.class,
                 TransportShardMultiTermsVectorAction.class);
+        // 删除文档 Action
         actions.register(DeleteAction.INSTANCE, TransportDeleteAction.class);
+        // 更新文档 Action
         actions.register(UpdateAction.INSTANCE, TransportUpdateAction.class);
+        // 批量获取文档 Action
         actions.register(MultiGetAction.INSTANCE, TransportMultiGetAction.class,
                 TransportShardMultiGetAction.class);
+        // 批量操作 Action
         actions.register(BulkAction.INSTANCE, TransportBulkAction.class,
                 TransportShardBulkAction.class);
+        // ========== 搜索 Action ==========
+        // 搜索 Action
         actions.register(SearchAction.INSTANCE, TransportSearchAction.class);
+        // 滚动搜索 Action
         actions.register(SearchScrollAction.INSTANCE, TransportSearchScrollAction.class);
+        // 批量搜索 Action
         actions.register(MultiSearchAction.INSTANCE, TransportMultiSearchAction.class);
+        // 解释查询 Action
         actions.register(ExplainAction.INSTANCE, TransportExplainAction.class);
+        // 清除滚动上下文 Action
         actions.register(ClearScrollAction.INSTANCE, TransportClearScrollAction.class);
+        // ========== 其他 Action ==========
+        // 恢复 Action
         actions.register(RecoveryAction.INSTANCE, TransportRecoveryAction.class);
+        // 重新加载安全配置 Action
         actions.register(NodesReloadSecureSettingsAction.INSTANCE, TransportNodesReloadSecureSettingsAction.class);
+        // 自动创建索引 Action
         actions.register(AutoCreateAction.INSTANCE, AutoCreateAction.TransportAction.class);
+        // 解析索引 Action
         actions.register(ResolveIndexAction.INSTANCE, ResolveIndexAction.TransportAction.class);
 
-        //Indexed scripts
+        // ========== 存储脚本 Action ==========
+        // 创建存储脚本 Action
         actions.register(PutStoredScriptAction.INSTANCE, TransportPutStoredScriptAction.class);
+        // 获取存储脚本 Action
         actions.register(GetStoredScriptAction.INSTANCE, TransportGetStoredScriptAction.class);
+        // 删除存储脚本 Action
         actions.register(DeleteStoredScriptAction.INSTANCE, TransportDeleteStoredScriptAction.class);
+        // 获取脚本上下文 Action
         actions.register(GetScriptContextAction.INSTANCE, TransportGetScriptContextAction.class);
+        // 获取脚本语言 Action
         actions.register(GetScriptLanguageAction.INSTANCE, TransportGetScriptLanguageAction.class);
 
+        // ========== 字段能力 Action ==========
         actions.register(FieldCapabilitiesAction.INSTANCE, TransportFieldCapabilitiesAction.class,
             TransportFieldCapabilitiesIndexAction.class);
 
+        // ========== 摄取管道 Action ==========
+        // 创建管道 Action
         actions.register(PutPipelineAction.INSTANCE, PutPipelineTransportAction.class);
+        // 获取管道 Action
         actions.register(GetPipelineAction.INSTANCE, GetPipelineTransportAction.class);
+        // 删除管道 Action
         actions.register(DeletePipelineAction.INSTANCE, DeletePipelineTransportAction.class);
+        // 模拟管道 Action
         actions.register(SimulatePipelineAction.INSTANCE, SimulatePipelineTransportAction.class);
 
+        // ========== 插件提供的 Action ==========
+        // 注册所有插件提供的 Action
         actionPlugins.stream().flatMap(p -> p.getActions().stream()).forEach(actions::register);
 
-        // Persistent tasks:
+        // ========== 持久化任务 Action ==========
         actions.register(StartPersistentTaskAction.INSTANCE, StartPersistentTaskAction.TransportAction.class);
         actions.register(UpdatePersistentTaskStatusAction.INSTANCE, UpdatePersistentTaskStatusAction.TransportAction.class);
         actions.register(CompletionPersistentTaskAction.INSTANCE, CompletionPersistentTaskAction.TransportAction.class);
         actions.register(RemovePersistentTaskAction.INSTANCE, RemovePersistentTaskAction.TransportAction.class);
 
-        // retention leases
+        // ========== 保留租约 Action ==========
         actions.register(RetentionLeaseActions.Add.INSTANCE, RetentionLeaseActions.Add.TransportAction.class);
         actions.register(RetentionLeaseActions.Renew.INSTANCE, RetentionLeaseActions.Renew.TransportAction.class);
         actions.register(RetentionLeaseActions.Remove.INSTANCE, RetentionLeaseActions.Remove.TransportAction.class);
 
-        // Dangling indices
+        // ========== 悬空索引 Action ==========
         actions.register(ListDanglingIndicesAction.INSTANCE, TransportListDanglingIndicesAction.class);
         actions.register(ImportDanglingIndexAction.INSTANCE, TransportImportDanglingIndexAction.class);
         actions.register(DeleteDanglingIndexAction.INSTANCE, TransportDeleteDanglingIndexAction.class);
         actions.register(FindDanglingIndexAction.INSTANCE, TransportFindDanglingIndexAction.class);
 
+        // 返回不可修改的 Action 映射
         return unmodifiableMap(actions.getRegistry());
     }
 
+    /**
+     * 设置并初始化 Action 过滤器链
+     * 
+     * @param actionPlugins Action 插件列表
+     * @return ActionFilters 实例，包含所有插件提供的过滤器
+     */
     private ActionFilters setupActionFilters(List<ActionPlugin> actionPlugins) {
         return new ActionFilters(
             Collections.unmodifiableSet(actionPlugins.stream().flatMap(p -> p.getActionFilters().stream()).collect(Collectors.toSet())));
     }
 
+    /**
+     * 初始化并注册所有的 REST 处理器
+     * 
+     * 这是 ActionModule 的另一个核心方法，负责：
+     * 1. 注册所有内置的 REST 处理器
+     * 2. 注册插件提供的 REST 处理器
+     * 3. 最后注册 CAT 主处理器
+     * 
+     * @param nodesInCluster 集群中节点的提供者
+     */
     public void initRestHandlers(Supplier<DiscoveryNodes> nodesInCluster) {
         List<AbstractCatAction> catActions = new ArrayList<>();
+        // 注册处理器的消费者，同时收集 CAT 处理器
         Consumer<RestHandler> registerHandler = handler -> {
             if (handler instanceof AbstractCatAction) {
                 catActions.add((AbstractCatAction) handler);
             }
             restController.registerHandler(handler);
         };
+        // ========== 节点和集群管理 REST 处理器 ==========
         registerHandler.accept(new RestAddVotingConfigExclusionAction());
         registerHandler.accept(new RestClearVotingConfigExclusionsAction());
         registerHandler.accept(new RestMainAction());
@@ -662,17 +870,20 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestClusterRerouteAction(settingsFilter));
         registerHandler.accept(new RestClusterSearchShardsAction());
         registerHandler.accept(new RestPendingClusterTasksAction());
+        // ========== 快照仓库 REST 处理器 ==========
         registerHandler.accept(new RestPutRepositoryAction());
         registerHandler.accept(new RestGetRepositoriesAction(settingsFilter));
         registerHandler.accept(new RestDeleteRepositoryAction());
         registerHandler.accept(new RestVerifyRepositoryAction());
         registerHandler.accept(new RestCleanupRepositoryAction());
+        // ========== 快照管理 REST 处理器 ==========
         registerHandler.accept(new RestGetSnapshotsAction());
         registerHandler.accept(new RestCreateSnapshotAction());
         registerHandler.accept(new RestCloneSnapshotAction());
         registerHandler.accept(new RestRestoreSnapshotAction());
         registerHandler.accept(new RestDeleteSnapshotAction());
         registerHandler.accept(new RestSnapshotsStatusAction());
+        // ========== 索引管理 REST 处理器 ==========
         registerHandler.accept(new RestGetIndicesAction());
         registerHandler.accept(new RestIndicesStatsAction());
         registerHandler.accept(new RestIndicesSegmentsAction());
@@ -690,11 +901,10 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestCloseIndexAction());
         registerHandler.accept(new RestOpenIndexAction());
         registerHandler.accept(new RestAddIndexBlockAction());
-
         registerHandler.accept(new RestUpdateSettingsAction());
         registerHandler.accept(new RestGetSettingsAction());
-
         registerHandler.accept(new RestAnalyzeAction());
+        // ========== 索引模板 REST 处理器 ==========
         registerHandler.accept(new RestGetIndexTemplateAction());
         registerHandler.accept(new RestPutIndexTemplateAction());
         registerHandler.accept(new RestDeleteIndexTemplateAction());
@@ -706,11 +916,11 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestDeleteComposableIndexTemplateAction());
         registerHandler.accept(new RestSimulateIndexTemplateAction());
         registerHandler.accept(new RestSimulateTemplateAction());
-
+        // ========== 映射管理 REST 处理器 ==========
         registerHandler.accept(new RestPutMappingAction());
         registerHandler.accept(new RestGetMappingAction(threadPool));
         registerHandler.accept(new RestGetFieldMappingAction());
-
+        // ========== 索引操作 REST 处理器 ==========
         registerHandler.accept(new RestRefreshAction());
         registerHandler.accept(new RestFlushAction());
         registerHandler.accept(new RestSyncedFlushAction());
@@ -719,7 +929,7 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestUpgradeStatusAction());
         registerHandler.accept(new RestClearIndicesCacheAction());
         registerHandler.accept(new RestResolveIndexAction());
-
+        // ========== 文档操作 REST 处理器 ==========
         registerHandler.accept(new RestIndexAction());
         registerHandler.accept(new CreateHandler());
         registerHandler.accept(new AutoIdHandler(nodesInCluster));
@@ -732,46 +942,37 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestMultiTermVectorsAction());
         registerHandler.accept(new RestBulkAction(settings));
         registerHandler.accept(new RestUpdateAction());
-
+        // ========== 搜索 REST 处理器 ==========
         registerHandler.accept(new RestSearchAction());
         registerHandler.accept(new RestSearchScrollAction());
         registerHandler.accept(new RestClearScrollAction());
         registerHandler.accept(new RestMultiSearchAction(settings));
-
         registerHandler.accept(new RestValidateQueryAction());
-
         registerHandler.accept(new RestExplainAction());
-
+        // ========== 其他 REST 处理器 ==========
         registerHandler.accept(new RestRecoveryAction());
-
         registerHandler.accept(new RestReloadSecureSettingsAction());
-
-        // Scripts API
+        // ========== 存储脚本 API ==========
         registerHandler.accept(new RestGetStoredScriptAction());
         registerHandler.accept(new RestPutStoredScriptAction());
         registerHandler.accept(new RestDeleteStoredScriptAction());
         registerHandler.accept(new RestGetScriptContextAction());
         registerHandler.accept(new RestGetScriptLanguageAction());
-
         registerHandler.accept(new RestFieldCapabilitiesAction());
-
-        // Tasks API
+        // ========== 任务 API ==========
         registerHandler.accept(new RestListTasksAction(nodesInCluster));
         registerHandler.accept(new RestGetTaskAction());
         registerHandler.accept(new RestCancelTasksAction(nodesInCluster));
-
-        // Ingest API
+        // ========== 摄取管道 API ==========
         registerHandler.accept(new RestPutPipelineAction());
         registerHandler.accept(new RestGetPipelineAction());
         registerHandler.accept(new RestDeletePipelineAction());
         registerHandler.accept(new RestSimulatePipelineAction());
-
-        // Dangling indices API
+        // ========== 悬空索引 API ==========
         registerHandler.accept(new RestListDanglingIndicesAction());
         registerHandler.accept(new RestImportDanglingIndexAction());
         registerHandler.accept(new RestDeleteDanglingIndexAction());
-
-        // CAT API
+        // ========== CAT API ==========
         registerHandler.accept(new RestAllocationAction());
         registerHandler.accept(new RestShardsAction());
         registerHandler.accept(new RestMasterAction());
@@ -779,9 +980,9 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestTasksAction(nodesInCluster));
         registerHandler.accept(new RestIndicesAction());
         registerHandler.accept(new RestSegmentsAction());
-        // Fully qualified to prevent interference with rest.action.count.RestCountAction
+        // 完全限定以避免与 rest.action.count.RestCountAction 冲突
         registerHandler.accept(new org.elasticsearch.rest.action.cat.RestCountAction());
-        // Fully qualified to prevent interference with rest.action.indices.RestRecoveryAction
+        // 完全限定以避免与 rest.action.indices.RestRecoveryAction 冲突
         registerHandler.accept(new RestCatRecoveryAction());
         registerHandler.accept(new RestHealthAction());
         registerHandler.accept(new org.elasticsearch.rest.action.cat.RestPendingClusterTasksAction());
@@ -793,33 +994,48 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestRepositoriesAction());
         registerHandler.accept(new RestSnapshotAction());
         registerHandler.accept(new RestTemplatesAction());
+        // ========== 插件提供的 REST 处理器 ==========
+        // 注册所有插件提供的 REST 处理器
         for (ActionPlugin plugin : actionPlugins) {
             for (RestHandler handler : plugin.getRestHandlers(settings, restController, clusterSettings, indexScopedSettings,
                     settingsFilter, indexNameExpressionResolver, nodesInCluster)) {
                 registerHandler.accept(handler);
             }
         }
+        // 最后注册 CAT 主处理器，它会聚合所有 CAT 处理器
         registerHandler.accept(new RestCatAction(catActions));
     }
 
+    /**
+     * 配置依赖注入绑定
+     * 
+     * 这是 Guice 模块的核心方法，负责：
+     * 1. 绑定 ActionFilters、DestructiveOperations 等核心组件
+     * 2. 绑定请求验证器
+     * 3. 绑定 AutoCreateIndex（仅非传输客户端模式）
+     * 4. 绑定所有 TransportAction 为单例
+     * 5. 注册 ActionType 到 TransportAction 的映射
+     */
     @Override
     protected void configure() {
+        // 绑定核心组件
         bind(ActionFilters.class).toInstance(actionFilters);
         bind(DestructiveOperations.class).toInstance(destructiveOperations);
+        // 绑定请求验证器
         bind(new TypeLiteral<RequestValidators<PutMappingRequest>>() {}).toInstance(mappingRequestValidators);
         bind(new TypeLiteral<RequestValidators<IndicesAliasesRequest>>() {}).toInstance(indicesAliasesRequestRequestValidators);
 
         if (false == transportClient) {
-            // Supporting classes only used when not a transport client
+            // 仅在非传输客户端模式下绑定的组件
             bind(AutoCreateIndex.class).toInstance(autoCreateIndex);
             bind(TransportLivenessAction.class).asEagerSingleton();
 
-            // register ActionType -> transportAction Map used by NodeClient
+            // 注册 ActionType -> TransportAction 的映射，供 NodeClient 使用
             @SuppressWarnings("rawtypes")
             MapBinder<ActionType, TransportAction> transportActionsBinder
                     = MapBinder.newMapBinder(binder(), ActionType.class, TransportAction.class);
             for (ActionHandler<?, ?> action : actions.values()) {
-                // bind the action as eager singleton, so the map binder one will reuse it
+                // 将 TransportAction 绑定为急切单例，以便映射绑定器可以重用它
                 bind(action.getTransportAction()).asEagerSingleton();
                 transportActionsBinder.addBinding(action.getAction()).to(action.getTransportAction()).asEagerSingleton();
                 for (Class<?> supportAction : action.getSupportTransportActions()) {
@@ -829,10 +1045,20 @@ public class ActionModule extends AbstractModule {
         }
     }
 
+    /**
+     * 获取 Action 过滤器
+     * 
+     * @return ActionFilters 实例
+     */
     public ActionFilters getActionFilters() {
         return actionFilters;
     }
 
+    /**
+     * 获取 REST 控制器
+     * 
+     * @return RestController 实例
+     */
     public RestController getRestController() {
         return restController;
     }
